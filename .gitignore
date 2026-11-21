@@ -43,4 +43,8 @@ terraform/terraform.rc
 # Uncomment the line below if you want to ignore planout files.
 # planout
 
+# Exclude your local temporary README file
 README-local.md
+
+# Exclude environment variable values
+.env
