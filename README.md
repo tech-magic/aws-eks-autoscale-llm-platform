@@ -92,6 +92,13 @@ python3 scripts/test_inference.py
 ./scripts/verify_gpu.sh
 ```
 
+### 5. Cleanup
+
+**Cleanup the entire EKS Cluster with vLLM Router (and any deployed LLMs) plus other external dependencies:**
+```bash
+./scripts/destroy.sh
+```
+
 ---
 
 ## Troubleshooting
