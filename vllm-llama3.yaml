@@ -1,78 +1,166 @@
+################################################################################
+# 1. VLLM AI MODEL WORKER DEPLOYMENT (Running Meta Llama-3.1-8B on AWS GPU)
+# ------------------------------------------------------------------------------
+# Why do we need this?
+# This Kubernetes Deployment defines the actual AI inference engine ("vLLM")
+# that loads Meta's Llama-3.1-8B model onto an NVIDIA GPU and serves an
+# OpenAI-compatible text generation API.
+#
+# How it works with the rest of your platform:
+# - When traffic is idle, KEDA can scale this Deployment down to 0 copies
+#   (pods), allowing Karpenter to shut down the expensive AWS GPU server.
+# - When new requests arrive at the vLLM Router, KEDA wakes up a pod here,
+#   Karpenter boots a `g4dn.xlarge` NVIDIA T4 GPU server in seconds, and vLLM
+#   reads the pre-cached model weights directly from your shared EFS drive.
+################################################################################
+
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vllm-llama3
   namespace: default
+
+  # Discovery Labels:
+  # - `vllm.ai/router-enabled: "true"` tells the vLLM Router to automatically
+  #   send traffic to this pod AND tells Prometheus PodMonitor to scrape its metrics.
+  # - `vllm.ai/model` is copied by Prometheus as the `model` label so KEDA can
+  #   track queue depth specifically for "llama-3.1-8b".
   labels:
     app: vllm-llama3
     vllm.ai/router-enabled: "true"
-    vllm.ai/model: "llama-3.1-8b" # Extracted as 'model' label by PodMonitor
+    vllm.ai/model: "llama-3.1-8b"
+
 spec:
-  replicas: 0 # KEDA ScaledObject manages scaling
+  # Start at 0 copies initially; KEDA's ScaledObject below takes over automatic
+  # scaling up and down based on real-time user request queues.
+  replicas: 0
+
+  # Zero-Downtime Update Strategy:
+  # When updating settings, spin up 1 new pod (`maxSurge: 1`) and wait for it to
+  # pass health checks before shutting down any existing pod (`maxUnavailable: 0`).
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 0
       maxSurge: 1
+
+  # Tells this Deployment which pods it owns and manages
   selector:
     matchLabels:
       app: vllm-llama3
+
+  # ----------------------------------------------------------------------------
+  # Pod Blueprint (Defines the Container, GPU Hardware, Storage & Health Checks)
+  # ----------------------------------------------------------------------------
   template:
     metadata:
       labels:
         app: vllm-llama3
         vllm.ai/router-enabled: "true"
-        vllm.ai/model: "llama-3.1-8b" # Extracted as 'model' label by PodMonitor
+        vllm.ai/model: "llama-3.1-8b"
+
     spec:
+      # 1. Hardware Targeting (NodeSelector):
+      # Forces Kubernetes & Karpenter to place this pod ONLY on a GPU worker node
+      # of exact type `g4dn.xlarge` (which has 4 vCPUs, 16 GB RAM, and 1x NVIDIA
+      # T4 GPU with 16 GB VRAM—ideal for 4-bit quantized 8B models).
       nodeSelector:
         workload: gpu
-        node.kubernetes.io/instance-type: g4dn.xlarge # Pins to g4dn.xlarge (1x T4 16GB)
+        node.kubernetes.io/instance-type: g4dn.xlarge
 
+      # 2. VIP Permission Pass for Tainted GPU Nodes (Tolerations):
+      # Because Karpenter puts a "No Entry" sign (`nvidia.com/gpu=present:NoSchedule`)
+      # on GPU servers to keep regular CPU apps off them, this toleration gives
+      # our AI engine explicit permission to land on the GPU server.
       tolerations:
         - key: "nvidia.com/gpu"
           operator: "Equal"
           value: "present"
           effect: "NoSchedule"
 
-      # Matches uid/gid 1000 configured on the efs-sc Access Point
+      # 3. Shared EFS File Ownership:
+      # Ensures the container writes/reads model files using Linux Group ID 1000,
+      # matching the `gid = "1000"` Access Point we configured on our EFS drive.
       securityContext:
         fsGroup: 1000
 
+      # ------------------------------------------------------------------------
+      # Main AI Inference Container (vLLM Engine)
+      # ------------------------------------------------------------------------
       containers:
         - name: vllm-engine
           image: vllm/vllm-openai:latest
           imagePullPolicy: IfNotPresent
+
+          # Startup Flags Tuning vLLM Speed, Memory & Throughput:
           args:
+            # Which Hugging Face model repository to load (4-bit AWQ compressed
+            # so the 8-billion parameter model fits comfortably in ~6 GB VRAM)
             - "--model"
             - "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+
+            # The clean model name clients pass in `"model": "llama-3.1-8b"`
             - "--served-model-name"
             - "llama-3.1-8b"
+
+            # Use the ultra-fast Marlin CUDA kernel optimized for 4-bit AWQ weights
             - "--quantization"
             - "awq_marlin"
+
+            # Run neural network math in 16-bit floating point (standard for T4 GPUs)
             - "--dtype"
             - "float16"
+
+            # Automatically match KV-cache precision to model dtype
             - "--kv-cache-dtype"
             - "auto"
+
+            # Reserve 88% of the T4's 16 GB VRAM for model weights + KV-cache memory
+            # (leaving 12% buffer so CUDA never crashes with Out-Of-Memory errors)
             - "--gpu-memory-utilization"
             - "0.88"
+
+            # Maximum conversation context length (16,384 tokens per prompt+reply)
             - "--max-model-len"
             - "16384"
+
+            # Maximum number of concurrent user requests processed in parallel
             - "--max-num-seqs"
             - "16"
+
+            # Maximum tokens processed in a single GPU forward pass
             - "--max-num-batched-tokens"
             - "4096"
+
+            # Reuse computed KV-cache blocks across requests that share identical
+            # system prompts (dramatically speeds up Time-To-First-Token)
             - "--enable-prefix-caching"
+
+            # Break huge prompts into smaller chunks so long prompts don't stall
+            # fast token generation for other active users
             - "--enable-chunked-prefill"
+
+            # Listen on all network interfaces inside the pod on port 8000
             - "--host"
             - "0.0.0.0"
             - "--port"
             - "8000"
+
+            # Keep container logs clean and fast by omitting per-request prompt dumps
             - "--disable-log-requests"
+
+          # Environment Variables & Secrets:
           env:
+            # Point Hugging Face's download cache folder to our mounted EFS drive
             - name: HF_HOME
               value: "/root/.cache/huggingface"
+
+            # Enable Rust-based multi-threaded high-speed downloads from Hugging Face
             - name: HF_HUB_ENABLE_HF_TRANSFER
               value: "1"
+
+            # Securely inject your Hugging Face access token from the Kubernetes Secret
+            # created in `eks.tf` (supports both current & legacy HF env var names)
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -83,10 +171,16 @@ spec:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
+
+          # Expose port 8000 (named "http" so Prometheus PodMonitor discovers it)
           ports:
             - name: http
               containerPort: 8000
               protocol: TCP
+
+          # Hardware Resource Reservations:
+          # Requests 3 out of 4 vCPUs, 12 out of 16 GB system RAM (leaving room for
+          # Kubernetes & GPU Operator agents), and 1 full NVIDIA GPU.
           resources:
             requests:
               cpu: "3"
@@ -96,15 +190,27 @@ spec:
               cpu: "3"
               memory: "12Gi"
               nvidia.com/gpu: "1"
+
+          # Principle of Least Privilege: Strip all unnecessary Linux root kernel
+          # capabilities from the container for hardened security
           securityContext:
             capabilities:
               drop:
                 - ALL
+
+          # Attach Storage Volumes into the Container's Filesystem:
           volumeMounts:
+            # Fast in-memory shared RAM disk needed by PyTorch/NCCL during GPU execution
             - name: dshm
               mountPath: /dev/shm
+
+            # Shared Amazon EFS drive where model weights are stored once and reused
             - name: model-cache
               mountPath: /root/.cache/huggingface
+
+          # Health Check 1 — Liveness Probe ("Are you frozen/crashed?"):
+          # Waits 2 minutes (`initialDelaySeconds: 120`) for the model to load into
+          # GPU VRAM, then pings `/health` every 15s. Restarts the pod if it hangs.
           livenessProbe:
             httpGet:
               path: /health
@@ -112,6 +218,10 @@ spec:
             initialDelaySeconds: 120
             periodSeconds: 15
             failureThreshold: 3
+
+          # Health Check 2 — Readiness Probe ("Are you ready to receive traffic?"):
+          # Checks `/health` after 45s. Kubernetes & the vLLM Router will NOT send
+          # user requests to this pod until the model finishes loading and passes this check.
           readinessProbe:
             httpGet:
               path: /health
@@ -120,31 +230,70 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
 
+      # Define the Physical Storage Volumes Referenced Above:
       volumes:
+        # 2 GB RAM-backed temporary filesystem for PyTorch shared memory
         - name: dshm
           emptyDir:
             medium: Memory
             sizeLimit: "2Gi"
+
+        # Connects to the shared ReadWriteMany EFS PersistentVolumeClaim (`efs.tf`)
         - name: model-cache
           persistentVolumeClaim:
             claimName: vllm-models-pvc
+
+
 ---
+################################################################################
+# 2. KEDA AUTOSCALER RULE (ScaledObject for Elastic GPU Scaling)
+# ------------------------------------------------------------------------------
+# Why do we need this?
+# This KEDA `ScaledObject` acts as the automatic cruise control for `vllm-llama3`:
+# - Every 10 seconds (`pollingInterval`), it asks Prometheus how many requests
+#   are waiting in line for `model="llama-3.1-8b"`.
+# - For every 2 queued requests (`threshold: "2"`), KEDA adds another vLLM
+#   GPU pod (up to `maxReplicaCount: 4`), prompting Karpenter to provision
+#   additional `g4dn.xlarge` GPU servers automatically.
+# - After traffic stops for 5 minutes (`cooldownPeriod: 300`), KEDA scales pods
+#   back down to `minReplicaCount`.
+################################################################################
+
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
   name: vllm-llama3-scaler
   namespace: default
 spec:
+  # Target the `vllm-llama3` Deployment defined above
   scaleTargetRef:
     name: vllm-llama3
+
+  # Check Prometheus queue metrics every 10 seconds
   pollingInterval: 10
+
+  # Wait 300 seconds (5 minutes) of zero traffic before scaling down pods
+  # (prevents shutting down a GPU node right before the next user message arrives)
   cooldownPeriod: 300
-  minReplicaCount: 1 # Set to 0 for true scale-to-zero on g4dn.xlarge
+
+  # Minimum number of pods to keep warm:
+  # - Currently set to `1` so 1 GPU stays warm with instant zero-cold-start replies.
+  # - Change to `0` for true scale-to-zero (pays $0/hr for GPUs when idle!).
+  minReplicaCount: 1
+
+  # Safety cap: Never scale beyond 4 parallel GPU pods for this model
   maxReplicaCount: 4
+
+  # Scaling Trigger (Reads our custom Prometheus recording rule from monitoring.tf):
   triggers:
     - type: prometheus
       metadata:
+        # Internal Kubernetes DNS address of our Prometheus server
         serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
         metricName: vllm_keda_model_queue_depth
+
+        # Target 2 queued/active requests per GPU pod before adding another replica
         threshold: "2"
+
+        # Query the unified queue depth metric specifically for Llama-3.1-8B
         query: sum(vllm:keda_model_queue_depth{model="llama-3.1-8b"})
