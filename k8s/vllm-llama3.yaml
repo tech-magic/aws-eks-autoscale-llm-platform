@@ -1,0 +1,150 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama3
+  namespace: default
+  labels:
+    app: vllm-llama3
+    vllm.ai/router-enabled: "true"
+    vllm.ai/model: "llama-3.1-8b" # Extracted as 'model' label by PodMonitor
+spec:
+  replicas: 0 # KEDA ScaledObject manages scaling
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: vllm-llama3
+  template:
+    metadata:
+      labels:
+        app: vllm-llama3
+        vllm.ai/router-enabled: "true"
+        vllm.ai/model: "llama-3.1-8b" # Extracted as 'model' label by PodMonitor
+    spec:
+      nodeSelector:
+        workload: gpu
+        node.kubernetes.io/instance-type: g4dn.xlarge # Pins to g4dn.xlarge (1x T4 16GB)
+
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Equal"
+          value: "present"
+          effect: "NoSchedule"
+
+      # Matches uid/gid 1000 configured on the efs-sc Access Point
+      securityContext:
+        fsGroup: 1000
+
+      containers:
+        - name: vllm-engine
+          image: vllm/vllm-openai:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--model"
+            - "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+            - "--served-model-name"
+            - "llama-3.1-8b"
+            - "--quantization"
+            - "awq_marlin"
+            - "--dtype"
+            - "float16"
+            - "--kv-cache-dtype"
+            - "auto"
+            - "--gpu-memory-utilization"
+            - "0.88"
+            - "--max-model-len"
+            - "16384"
+            - "--max-num-seqs"
+            - "16"
+            - "--max-num-batched-tokens"
+            - "4096"
+            - "--enable-prefix-caching"
+            - "--enable-chunked-prefill"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            - "--disable-log-requests"
+          env:
+            - name: HF_HOME
+              value: "/root/.cache/huggingface"
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "3"
+              memory: "12Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "3"
+              memory: "12Gi"
+              nvidia.com/gpu: "1"
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 45
+            periodSeconds: 10
+            failureThreshold: 3
+
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "2Gi"
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vllm-models-pvc
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-llama3-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: vllm-llama3
+  pollingInterval: 10
+  cooldownPeriod: 300
+  minReplicaCount: 1 # Set to 0 for true scale-to-zero on g4dn.xlarge
+  maxReplicaCount: 4
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: vllm_keda_model_queue_depth
+        threshold: "2"
+        query: sum(vllm:keda_model_queue_depth{model="llama-3.1-8b"})
