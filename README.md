@@ -87,6 +87,11 @@ pip install openai boto3
 python3 scripts/test_inference.py
 ```
 
+**Verify NVidia GPU Stats:**
+```bash
+./scripts/verify_gpu.sh
+```
+
 ---
 
 ## Troubleshooting
